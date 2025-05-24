@@ -157,10 +157,45 @@ def process_file(file_path, calibration_offset=132.53):
 
     return dbfs_levels, fs, timestamps, dba_levels, valid_timestamps, valid_dba_levels, discarded_percentage
 
+def process_window_file(file_path, calibration_offset=132.53):
+    """
+    Processes a window file (opened or closed) to calculate calibrated dBA values.
+    Clips 5 seconds from the start and end of the recording.
+    """
+    audio = AudioSegment.from_file(file_path)
+    fs = audio.frame_rate
+    samples = np.array(audio.get_array_of_samples()).astype(np.float32)
+    bit_depth = audio.sample_width * 8
+    samples /= float(2 ** (bit_depth - 1))
+    if audio.channels > 1:
+        samples = samples.reshape((-1, audio.channels)).mean(axis=1)
 
+    # Clip 5 seconds from the start and end
+    start_clip = 5 * fs
+    end_clip = len(samples) - 5 * fs
+    if end_clip <= start_clip:
+        raise ValueError(f"File {file_path} is too short to clip 5 seconds from start and end.")
+
+    clipped_samples = samples[start_clip:end_clip]
+    weighted_samples = apply_a_weighting(clipped_samples, fs)
+
+    # Calculate dBA levels
+    step = fs  # 1-second intervals
+    dba_levels = []
+    timestamps = []
+
+    for i in range(0, len(clipped_samples) - step + 1, step):
+        chunk = weighted_samples[i:i + step]
+        dba_levels.append(dbfs(chunk) + calibration_offset)
+        timestamps.append((start_clip + i) / fs)
+
+    return dba_levels, timestamps
+
+import csv
 def process_folder(data_folder, output_folder):
     results = []
     plots = []
+    attenuation_results = []
     valid_ranges = {}
     total_raw_minutes = 0
     total_good_minutes = 0
@@ -173,6 +208,85 @@ def process_folder(data_folder, output_folder):
         output_subfolder = os.path.join(output_folder, relative_path)
         os.makedirs(output_subfolder, exist_ok=True)
 
+        # Process window attenuation
+        window_opened_path = None
+        window_closed_path = None
+
+        # Check for both .m4a and .mp4 extensions for window_opened
+        for ext in [".m4a", ".mp4"]:
+            potential_path = os.path.join(root, f"window_opened{ext}")
+            if os.path.exists(potential_path):
+                window_opened_path = potential_path
+                break
+
+        # Check for both .m4a and .mp4 extensions for window_closed
+        for ext in [".m4a", ".mp4"]:
+            potential_path = os.path.join(root, f"window_closed{ext}")
+            if os.path.exists(potential_path):
+                window_closed_path = potential_path
+                break
+
+        # Handle missing window_closed file
+        if not window_closed_path:
+            recording_01_path = None
+            for ext in [".m4a", ".mp4"]:
+                potential_path = os.path.join(root, f"recording_01{ext}")
+                if os.path.exists(potential_path):
+                    recording_01_path = potential_path
+                    break
+
+            if recording_01_path:
+                audio = AudioSegment.from_file(recording_01_path)
+                window_closed_audio = audio[500000:600000]  # 500 to 600 seconds
+                window_closed_path = os.path.join(output_subfolder, "window_closed.mp4")
+                window_closed_audio.export(window_closed_path, format="mp4")
+                print(f"Generated missing window_closed file: {window_closed_path}")
+
+        if relative_path == ".":
+            continue
+
+        elif 'friend' not in relative_path.lower():
+            continue
+
+        if os.path.exists(window_opened_path) and os.path.exists(window_closed_path):
+            window_opened_dba, window_opened_timestamps = process_window_file(window_opened_path)
+            window_closed_dba, window_closed_timestamps = process_window_file(window_closed_path)
+
+            mean_opened = np.mean(window_opened_dba)
+            mean_closed = np.mean(window_closed_dba)
+            attenuation = mean_opened - mean_closed
+
+            attenuation_results.append({
+                "Folder": relative_path,
+                "Window Opened Mean dBA": round(mean_opened, 2),
+                "Window Closed Mean dBA": round(mean_closed, 2),
+                "Attenuation (dBA)": round(attenuation, 2)
+            })
+
+            # Plot window signals
+            plt.figure(figsize=(12, 8))
+            plt.plot(window_opened_timestamps, window_opened_dba, label="Window Opened", color="blue")
+            plt.plot(window_closed_timestamps, window_closed_dba, label="Window Closed", color="red")
+            plt.axhline(mean_opened, color="blue", linestyle="--", label="Mean Opened")
+            plt.axhline(mean_closed, color="red", linestyle="--", label="Mean Closed")
+            plt.xlabel("Time (s)")
+            plt.ylabel("dB(A)")
+            plt.title(f"Window Signals for {relative_path}")
+            plt.legend()
+            plt.grid()
+            window_plot_path = os.path.join(output_subfolder, "window_signals_plot.png")
+            plt.savefig(window_plot_path)
+            plt.close()
+
+            # Add only the window signals plot to the plots list
+            plots.append({
+                "File": f"Window Signals ({relative_path})",
+                "Raw Plot Path": window_plot_path,
+                "dB(A) Plot Path": None,  # No cropped dBA plot for window signals
+                "dB(A) With Attenuation Plot Path": None  # No attenuation plot for window signals
+            })
+
+        # Process main recordings
         device_info = "Unknown"
         device_file_path = os.path.join(root, "device.txt")
         if os.path.exists(device_file_path):
@@ -188,7 +302,9 @@ def process_folder(data_folder, output_folder):
                "open" not in f_lower and "close" not in f_lower and "calibration" not in f_lower:
                 file_path = os.path.join(root, f)
                 try:
-                    dbfs_levels, fs, timestamps, dba_levels, valid_timestamps, valid_dba_levels, discarded_percentage = process_file(file_path, calibration_offset=132.53)
+
+                    dbfs_levels, fs, timestamps, dba_levels, valid_timestamps, valid_dba_levels, discarded_percentage = process_file(
+                        file_path, calibration_offset=132.53 + attenuation)
 
                     avg_dba = np.mean(dba_levels)
                     avg_valid_dba = np.mean(valid_dba_levels)
@@ -224,9 +340,9 @@ def process_folder(data_folder, output_folder):
                     plt.savefig(raw_plot_path)
                     plt.close()
 
-                    # Plot cropped dBA levels
+                    dba_levels = [dba - attenuation for dba in valid_dba_levels]
                     plt.figure(figsize=(12, 8))
-                    plt.plot(valid_timestamps, valid_dba_levels, label="Cropped dBA Levels")
+                    plt.plot(valid_timestamps, dba_levels, label="Cropped dBA Levels (Calibration Only)")
                     plt.xlabel("Time (s)")
                     plt.ylabel("dB(A)")
                     plt.title(f"Cropped dBA Levels for {os.path.basename(file_path)}")
@@ -236,13 +352,47 @@ def process_folder(data_folder, output_folder):
                     plt.savefig(dba_plot_path)
                     plt.close()
 
+                    # Plot cropped dBA levels (with window attenuation)
+                    
+                    plt.figure(figsize=(12, 8))
+                    plt.plot(valid_timestamps, valid_dba_levels, label="Cropped dBA Levels (With Window Attenuation)")
+                    plt.xlabel("Time (s)")
+                    plt.ylabel("dB(A)")
+                    plt.title(f"Cropped dBA Levels (With Window Attenuation) for {os.path.basename(file_path)}")
+                    plt.legend()
+                    plt.grid()
+                    dba_with_attenuation_plot_path = os.path.join(output_subfolder, f"{os.path.splitext(f)[0]}_dba_with_attenuation_plot.png")
+                    plt.savefig(dba_with_attenuation_plot_path)
+                    plt.close()
+
+                    # Add all three plots for main recordings
                     plots.append({
                         "File": os.path.relpath(file_path, data_folder),
                         "Raw Plot Path": raw_plot_path,
-                        "dB(A) Plot Path": dba_plot_path
+                        "dB(A) Plot Path": dba_plot_path,
+                        "dB(A) With Attenuation Plot Path": dba_with_attenuation_plot_path
                     })
 
-                    print(f"Plots saved to {raw_plot_path} and {dba_plot_path}")
+                    # Generate CSV files
+                    base_filename = os.path.splitext(f)[0]
+                    closed_csv_path = os.path.join(output_subfolder, f"{base_filename}_closed.csv")
+                    open_csv_path = os.path.join(output_subfolder, f"{base_filename}_open.csv")
+
+                    # Write closed CSV (calibration offset only)
+                    with open(closed_csv_path, mode="w", newline="") as closed_csv:
+                        writer = csv.writer(closed_csv)
+                        writer.writerow(["Timestamp (s)", "dBA (Calibration Only)"])
+                        for ts, dba in zip(valid_timestamps, dba_levels):
+                            writer.writerow([ts, dba])
+
+                    # Write open CSV (calibration + attenuation offset)
+                    with open(open_csv_path, mode="w", newline="") as open_csv:
+                        writer = csv.writer(open_csv)
+                        writer.writerow(["Timestamp (s)", "dBA (Calibration + Attenuation)"])
+                        for ts, dba in zip(valid_timestamps, valid_dba_levels):
+                            writer.writerow([ts, dba])
+
+                    print(f"Plots and CSV files saved for {file_path}")
 
                 except Exception as e:
                     print(f"Error processing {file_path}: {e}")
@@ -254,9 +404,9 @@ def process_folder(data_folder, output_folder):
 
     total_discarded_percentage = ((total_raw_minutes - total_good_minutes) / total_raw_minutes) * 100 if total_raw_minutes > 0 else 0
 
-    return pd.DataFrame(results), plots, total_raw_minutes, total_good_minutes, total_discarded_percentage, calibration_plot
+    return pd.DataFrame(results), plots, total_raw_minutes, total_good_minutes, total_discarded_percentage, calibration_plot, attenuation_results
 
-def generate_html_report(results_df, plots, output_path, total_raw_minutes, total_good_minutes, total_discarded_percentage, calibration_plot):
+def generate_html_report(results_df, plots, output_path, total_raw_minutes, total_good_minutes, total_discarded_percentage, calibration_plot, attenuation_results):
     """
     Generates an HTML report with the results and plots.
     """
@@ -270,7 +420,7 @@ def generate_html_report(results_df, plots, output_path, total_raw_minutes, tota
             table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
             th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
             th { background-color: #f2f2f2; }
-            img { max-width: 48%; height: auto; margin-right: 2%; }
+            img { max-width: 30%; height: auto; margin-right: 1%; }
             .plot-container { display: flex; justify-content: space-between; margin-bottom: 40px; }
         </style>
     </head>
@@ -282,6 +432,27 @@ def generate_html_report(results_df, plots, output_path, total_raw_minutes, tota
         <p><strong>Percentage of Data Discarded:</strong> {{ total_discarded_percentage }}%</p>
         <h2>Calibration Plot</h2>
         <img src="{{ calibration_plot }}" alt="Calibration Plot">
+        <h2>Window Attenuation Results</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Folder</th>
+                    <th>Window Opened Mean dBA</th>
+                    <th>Window Closed Mean dBA</th>
+                    <th>Attenuation (dBA)</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in attenuation_results %}
+                <tr>
+                    <td>{{ row["Folder"] }}</td>
+                    <td>{{ row["Window Opened Mean dBA"] }}</td>
+                    <td>{{ row["Window Closed Mean dBA"] }}</td>
+                    <td>{{ row["Attenuation (dBA)"] }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
         <h2>Details</h2>
         <table>
             <thead>
@@ -309,8 +480,15 @@ def generate_html_report(results_df, plots, output_path, total_raw_minutes, tota
         {% for plot in plots %}
         <h3>{{ plot["File"] }}</h3>
         <div class="plot-container">
+            {% if plot["Raw Plot Path"] %}
             <img src="{{ plot["Raw Plot Path"] }}" alt="Raw dBFS Plot for {{ plot['File'] }}">
+            {% endif %}
+            {% if plot["dB(A) Plot Path"] %}
             <img src="{{ plot["dB(A) Plot Path"] }}" alt="Cropped dBA Plot for {{ plot['File'] }}">
+            {% endif %}
+            {% if plot["dB(A) With Attenuation Plot Path"] %}
+            <img src="{{ plot["dB(A) With Attenuation Plot Path"] }}" alt="Cropped dBA Plot (With Window Attenuation) for {{ plot['File'] }}">
+            {% endif %}
         </div>
         {% endfor %}
     </body>
@@ -323,7 +501,8 @@ def generate_html_report(results_df, plots, output_path, total_raw_minutes, tota
         total_raw_minutes=round(total_raw_minutes, 2),
         total_good_minutes=round(total_good_minutes, 2),
         total_discarded_percentage=round(total_discarded_percentage, 2),
-        calibration_plot=calibration_plot
+        calibration_plot=calibration_plot,
+        attenuation_results=attenuation_results
     )
     with open(output_path, "w") as f:
         f.write(html_content)
@@ -340,11 +519,11 @@ if __name__ == "__main__":
         print(f"Folder '{data_folder}' does not exist.")
         exit()
 
-    results_df, plots, total_raw_minutes, total_good_minutes, total_discarded_percentage, calibration_plot = process_folder(data_folder, output_folder)
+    results_df, plots, total_raw_minutes, total_good_minutes, total_discarded_percentage, calibration_plot, attenuation_results = process_folder(data_folder, output_folder)
 
     if results_df.empty:
         print("No valid recordings found.")
     else:
         # Save the HTML report in the processed_output folder
         html_path = os.path.join(output_folder, "processing_report.html")
-        generate_html_report(results_df, plots, html_path, total_raw_minutes, total_good_minutes, total_discarded_percentage, calibration_plot)
+        generate_html_report(results_df, plots, html_path, total_raw_minutes, total_good_minutes, total_discarded_percentage, calibration_plot, attenuation_results)
