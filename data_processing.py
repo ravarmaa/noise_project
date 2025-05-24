@@ -304,7 +304,7 @@ def process_folder(data_folder, output_folder):
                 try:
 
                     dbfs_levels, fs, timestamps, dba_levels, valid_timestamps, valid_dba_levels, discarded_percentage = process_file(
-                        file_path, calibration_offset=132.53 + attenuation)
+                        file_path, calibration_offset=132.53)
 
                     avg_dba = np.mean(dba_levels)
                     avg_valid_dba = np.mean(valid_dba_levels)
@@ -340,25 +340,24 @@ def process_folder(data_folder, output_folder):
                     plt.savefig(raw_plot_path)
                     plt.close()
 
-                    dba_levels = [dba - attenuation for dba in valid_dba_levels]
                     plt.figure(figsize=(12, 8))
-                    plt.plot(valid_timestamps, dba_levels, label="Cropped dBA Levels (Calibration Only)")
+                    plt.plot(valid_timestamps, valid_dba_levels, label="dBA (Calibration Only)")
                     plt.xlabel("Time (s)")
                     plt.ylabel("dB(A)")
-                    plt.title(f"Cropped dBA Levels for {os.path.basename(file_path)}")
+                    plt.title(f"Calibrated dBA Levels for {os.path.basename(file_path)}")
                     plt.legend()
                     plt.grid()
                     dba_plot_path = os.path.join(output_subfolder, f"{os.path.splitext(f)[0]}_dba_plot.png")
                     plt.savefig(dba_plot_path)
                     plt.close()
 
-                    # Plot cropped dBA levels (with window attenuation)
-                    
+                    # Plot estimated outdoor levels by applying attenuation
+                    estimated_outdoor_dba = [dba + attenuation for dba in valid_dba_levels]
                     plt.figure(figsize=(12, 8))
-                    plt.plot(valid_timestamps, valid_dba_levels, label="Cropped dBA Levels (With Window Attenuation)")
+                    plt.plot(valid_timestamps, estimated_outdoor_dba, label="Estimated Outdoor dBA (With Attenuation)")
                     plt.xlabel("Time (s)")
                     plt.ylabel("dB(A)")
-                    plt.title(f"Cropped dBA Levels (With Window Attenuation) for {os.path.basename(file_path)}")
+                    plt.title(f"Estimated Outdoor dBA for {os.path.basename(file_path)}")
                     plt.legend()
                     plt.grid()
                     dba_with_attenuation_plot_path = os.path.join(output_subfolder, f"{os.path.splitext(f)[0]}_dba_with_attenuation_plot.png")
@@ -382,14 +381,14 @@ def process_folder(data_folder, output_folder):
                     with open(closed_csv_path, mode="w", newline="") as closed_csv:
                         writer = csv.writer(closed_csv)
                         writer.writerow(["Timestamp (s)", "dBA (Calibration Only)"])
-                        for ts, dba in zip(valid_timestamps, dba_levels):
+                        for ts, dba in zip(valid_timestamps, valid_dba_levels):
                             writer.writerow([ts, dba])
 
-                    # Write open CSV (calibration + attenuation offset)
+                    # Write open CSV (estimated outdoor level)
                     with open(open_csv_path, mode="w", newline="") as open_csv:
                         writer = csv.writer(open_csv)
-                        writer.writerow(["Timestamp (s)", "dBA (Calibration + Attenuation)"])
-                        for ts, dba in zip(valid_timestamps, valid_dba_levels):
+                        writer.writerow(["Timestamp (s)", "Estimated Outdoor dBA (With Attenuation)"])
+                        for ts, dba in zip(valid_timestamps, estimated_outdoor_dba):
                             writer.writerow([ts, dba])
 
                     print(f"Plots and CSV files saved for {file_path}")
