@@ -245,8 +245,8 @@ def process_folder(data_folder, output_folder):
         if relative_path == ".":
             continue
 
-        elif 'friend' not in relative_path.lower():
-            continue
+        # elif 'friend' not in relative_path.lower():
+        #     continue
 
         if os.path.exists(window_opened_path) and os.path.exists(window_closed_path):
             window_opened_dba, window_opened_timestamps = process_window_file(window_opened_path)
@@ -421,7 +421,18 @@ def generate_html_report(results_df, plots, output_path, total_raw_minutes, tota
             th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
             th { background-color: #f2f2f2; }
             img { max-width: 30%; height: auto; margin-right: 1%; }
-            .plot-container { display: flex; justify-content: space-between; margin-bottom: 40px; }
+            .plot-container { 
+                display: flex; 
+                justify-content: space-between; 
+                margin-bottom: 40px; 
+                page-break-inside: avoid; /* Prevent splitting across pages */
+            }
+            .plot-container img {
+                page-break-inside: avoid; /* Prevent images from being split */
+            }
+            .section {
+                page-break-inside: avoid; /* Prevent sections from being split */
+            }
         </style>
     </head>
     <body>
@@ -431,7 +442,9 @@ def generate_html_report(results_df, plots, output_path, total_raw_minutes, tota
         <p><strong>Total Good Data:</strong> {{ total_good_minutes }} minutes</p>
         <p><strong>Percentage of Data Discarded:</strong> {{ total_discarded_percentage }}%</p>
         <h2>Calibration Plot</h2>
-        <img src="{{ calibration_plot }}" alt="Calibration Plot">
+        <div class="section">
+            <img src="{{ calibration_plot }}" alt="Calibration Plot">
+        </div>
         <h2>Window Attenuation Results</h2>
         <table>
             <thead>
@@ -508,6 +521,22 @@ def generate_html_report(results_df, plots, output_path, total_raw_minutes, tota
         f.write(html_content)
     print(f"HTML report saved to {output_path}")
 
+
+import pdfkit
+
+def generate_pdf_report(html_path, pdf_path):
+    """
+    Converts an HTML report to a PDF report using pdfkit.
+    """
+    options = {
+        'enable-local-file-access': None  # Allow access to local files
+    }
+    try:
+        pdfkit.from_file(html_path, pdf_path, options=options)
+        print(f"PDF report saved to {pdf_path}")
+    except Exception as e:
+        print(f"Error generating PDF report: {e}")
+
 if __name__ == "__main__":
     main_folder = "/home/stan/Documents/noise_project"
 
@@ -527,3 +556,7 @@ if __name__ == "__main__":
         # Save the HTML report in the processed_output folder
         html_path = os.path.join(output_folder, "processing_report.html")
         generate_html_report(results_df, plots, html_path, total_raw_minutes, total_good_minutes, total_discarded_percentage, calibration_plot, attenuation_results)
+
+        # Convert the HTML report to a PDF report
+        pdf_path = os.path.join(output_folder, "processing_report.pdf")
+        generate_pdf_report(html_path, pdf_path)
