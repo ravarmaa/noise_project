@@ -182,7 +182,13 @@ def process_file(file_path, calibration_offset=132.53):
 
     discarded_percentage = ((valid_start + (duration - valid_end)) / duration) * 100
 
-    return dbfs_levels, fs, timestamps, dba_levels, valid_timestamps, valid_dba_levels, discarded_percentage
+    # Calculate Lday
+    if valid_dba_levels:
+        lday = 10 * np.log10(np.mean(10 ** (np.array(valid_dba_levels) / 10)))
+    else:
+        lday = None
+
+    return dbfs_levels, fs, timestamps, dba_levels, valid_timestamps, valid_dba_levels, discarded_percentage, lday
 
 
 from scipy.interpolate import interp1d
@@ -362,7 +368,7 @@ def process_folder(data_folder, output_folder):
                 file_path = os.path.join(root, f)
                 try:
 
-                    dbfs_levels, fs, timestamps, dba_levels, valid_timestamps, valid_dba_levels, discarded_percentage = process_file(
+                    dbfs_levels, fs, timestamps, dba_levels, valid_timestamps, valid_dba_levels, discarded_percentage, lday = process_file(
                         file_path, calibration_offset=132.53)
 
                     avg_dba = np.mean(dba_levels)
@@ -382,9 +388,12 @@ def process_folder(data_folder, output_folder):
                     results.append({
                         "File": os.path.relpath(file_path, data_folder),
                         "Device Info": device_info,
-                        "Average dB(A)": round(avg_dba, 2),
-                        "Average Valid dB(A)": round(avg_valid_dba, 2),
-                        "Discarded (%)": round(discarded_percentage, 2)
+                        "Total Duration (s)": round(timestamps[-1] - timestamps[0], 2),
+                        "Average indoor dB(A)": round(avg_valid_dba),
+                        "Min indoor dB(A)": round(np.min(valid_dba_levels), 2),
+                        "Max indoor dB(A)": round(np.max(valid_dba_levels), 2),
+                        "Discarded (%)": round(discarded_percentage, 2),
+                        "Indoor Lday": round(lday, 2) if lday is not None else "N/A"
                     })
 
                     # Plot raw dBFS levels
@@ -480,12 +489,21 @@ def generate_html_report(results_df, plots, output_path, total_raw_minutes, tota
             table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
             th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
             th { background-color: #f2f2f2; }
-            img { max-width: 45%; height: auto; margin-right: 2%; }
-            .plot-container { 
-                display: flex; 
-                justify-content: space-between; 
-                margin-bottom: 40px; 
+            img { 
+                max-width: 100%;  /* Ensure images fit within the container */
+                height: auto;    /* Maintain aspect ratio */
+                display: block;  /* Prevent inline spacing issues */
+                margin: 0 auto;  /* Center the images */
+            }
+            .plot-table {
+                width: 100%;
+                margin-bottom: 40px;
                 page-break-inside: avoid; /* Prevent splitting across pages */
+            }
+            .plot-table td {
+                width: 50%; /* Ensure two plots fit side by side */
+                text-align: center; /* Center the plots */
+                vertical-align: top;
             }
         </style>
     </head>
@@ -496,10 +514,12 @@ def generate_html_report(results_df, plots, output_path, total_raw_minutes, tota
         <p><strong>Total Good Data:</strong> {{ total_good_minutes }} minutes</p>
         <p><strong>Percentage of Data Discarded:</strong> {{ total_discarded_percentage }}%</p>
         <h2>Calibration Plots</h2>
-        <div class="plot-container">
-            <img src="{{ unsynced_plot }}" alt="Unsynced Calibration Plot">
-            <img src="{{ synced_plot }}" alt="Synced Calibration Plot">
-        </div>
+        <table class="plot-table">
+            <tr>
+                <td><img src="{{ unsynced_plot }}" alt="Unsynced Calibration Plot"></td>
+                <td><img src="{{ synced_plot }}" alt="Synced Calibration Plot"></td>
+            </tr>
+        </table>
         <h2>Window Attenuation Results</h2>
         <table>
             <thead>
@@ -527,9 +547,12 @@ def generate_html_report(results_df, plots, output_path, total_raw_minutes, tota
                 <tr>
                     <th>File</th>
                     <th>Device Info</th>
-                    <th>Average dB(A)</th>
-                    <th>Average Valid dB(A)</th>
+                    <th>Total Duration (s)</th>
                     <th>Discarded (%)</th>
+                    <th>Average indoor dB(A)</th>
+                    <th>Min indoor dB(A)</th>
+                    <th>Max indoor dB(A)</th>
+                    <th>Indoor Lday</th>
                 </tr>
             </thead>
             <tbody>
@@ -537,9 +560,12 @@ def generate_html_report(results_df, plots, output_path, total_raw_minutes, tota
                 <tr>
                     <td>{{ row["File"] }}</td>
                     <td>{{ row["Device Info"] }}</td>
-                    <td>{{ row["Average dB(A)"] }}</td>
-                    <td>{{ row["Average Valid dB(A)"] }}</td>
+                    <td>{{ row["Total Duration (s)"] }}</td>
                     <td>{{ row["Discarded (%)"] }}</td>
+                    <td>{{ row["Average indoor dB(A)"] }}</td>
+                    <td>{{ row["Min indoor dB(A)"] }}</td>
+                    <td>{{ row["Max indoor dB(A)"] }}</td>
+                    <td>{{ row["Indoor Lday"] }}</td>
                 </tr>
                 {% endfor %}
             </tbody>
@@ -547,17 +573,21 @@ def generate_html_report(results_df, plots, output_path, total_raw_minutes, tota
         <h2>Plots</h2>
         {% for plot in plots %}
         <h3>{{ plot["File"] }}</h3>
-        <div class="plot-container">
-            {% if plot["Raw Plot Path"] %}
-            <img src="{{ plot["Raw Plot Path"] }}" alt="Raw dBFS Plot for {{ plot['File'] }}">
-            {% endif %}
-            {% if plot["dB(A) Plot Path"] %}
-            <img src="{{ plot["dB(A) Plot Path"] }}" alt="Cropped dBA Plot for {{ plot['File'] }}">
-            {% endif %}
-            {% if plot["dB(A) With Attenuation Plot Path"] %}
-            <img src="{{ plot["dB(A) With Attenuation Plot Path"] }}" alt="Cropped dBA Plot (With Window Attenuation) for {{ plot['File'] }}">
-            {% endif %}
-        </div>
+        <table class="plot-table">
+            <tr>
+                {% if plot["Raw Plot Path"] %}
+                <td><img src="{{ plot["Raw Plot Path"] }}" alt="Raw dBFS Plot for {{ plot['File'] }}"></td>
+                {% endif %}
+                {% if plot["dB(A) Plot Path"] %}
+                <td><img src="{{ plot["dB(A) Plot Path"] }}" alt="Cropped dBA Plot for {{ plot['File'] }}"></td>
+                {% endif %}
+            </tr>
+            <tr>
+                {% if plot["dB(A) With Attenuation Plot Path"] %}
+                <td colspan="2"><img src="{{ plot["dB(A) With Attenuation Plot Path"] }}" alt="Cropped dBA Plot (With Window Attenuation) for {{ plot['File'] }}"></td>
+                {% endif %}
+            </tr>
+        </table>
         {% endfor %}
     </body>
     </html>
