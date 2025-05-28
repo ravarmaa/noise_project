@@ -29,6 +29,126 @@ def a_weighting_filter(fs):
         raise ValueError(f"A-weighting filter not supported for fs = {fs}. Supported: 44100, 48000 Hz.")
 
 
+import json
+from scipy.signal import find_peaks
+
+def extract_above_dba_segments(file_path, timestamps, dba_levels, output_folder, threshold=60):
+    """
+    Extracts segments where the calibrated dBA level exceeds the given threshold and saves them to the output folder.
+    If the total number of events is less than 10, selects the top 10 peaks regardless of the threshold.
+    Adds a 3-second margin before and after each event.
+    Outputs a JSON file with event metadata.
+    If the JSON file already exists, skips extraction and removes unlisted MP3 files.
+    """
+    # Create the output folder if it doesn't exist
+    above_folder = os.path.join(output_folder, f"above_{threshold}_dba")
+
+    print(above_folder)
+    os.makedirs(above_folder, exist_ok=True)
+
+    # Define the JSON path
+    json_path = os.path.join(above_folder, f"{os.path.splitext(os.path.basename(file_path))[0]}_events.json")
+
+    # If the JSON file already exists, skip extraction
+    if os.path.exists(json_path):
+        print(f"JSON file already exists: {json_path}. Skipping extraction.")
+        # Load the existing JSON file
+        with open(json_path, "r") as json_file:
+            events = json.load(json_file)
+
+        # Get the list of filenames from the JSON
+        valid_filenames = {event["filename"] for event in events}
+
+        # Remove any MP3 files in the directory that are not in the JSON
+        for file in os.listdir(above_folder):
+            if file.endswith(".mp3") and file not in valid_filenames:
+                file_to_remove = os.path.join(above_folder, file)
+                os.remove(file_to_remove)
+                print(f"Removed unlisted file: {file_to_remove}")
+
+        return  # Exit the function
+
+    # Load the original audio file
+    audio = AudioSegment.from_file(file_path)
+
+    # Identify segments where dBA > threshold
+    margin = 3  # seconds
+    segments = []
+
+    # Identify segments where dBA > threshold
+    start_idx = None
+    for i, dba in enumerate(dba_levels):
+        if dba > threshold:
+            if start_idx is None:
+                start_idx = i
+        else:
+            if start_idx is not None:
+                # End of a segment
+                end_idx = i - 1
+                segments.append((start_idx, end_idx))
+                start_idx = None
+
+    # Handle the case where the last segment extends to the end
+    if start_idx is not None:
+        segments.append((start_idx, len(dba_levels) - 1))
+
+    # If the number of segments is less than 10, add unique peaks to reach 10 total
+    if len(segments) < 10:
+        # Find peaks with a minimum distance between them
+        peak_indices, _ = find_peaks(dba_levels, distance=5)  # Minimum distance of 5 indices between peaks
+        sorted_peaks = sorted(peak_indices, key=lambda i: dba_levels[i], reverse=True)  # Sort peaks by dBA level
+
+        # Track indices already covered by existing segments
+        covered_indices = set()
+        for start, end in segments:
+            covered_indices.update(range(start, end + 1))
+
+        # Add unique peaks not already covered by segments
+        for peak_idx in sorted_peaks:
+            if peak_idx not in covered_indices:
+                segments.append((peak_idx, peak_idx))  # Treat the peak as a single-point segment
+                covered_indices.add(peak_idx)
+            if len(segments) >= 10:
+                break
+
+    # Prepare JSON metadata
+    events = []
+
+    # Extract and save each segment
+    for start_idx, end_idx in segments:
+        # Calculate start and end times with margin
+        start_time = max(0, timestamps[start_idx] - margin) * 1000  # Convert to milliseconds
+        end_time = min(timestamps[end_idx] + margin, len(audio) / 1000) * 1000  # Convert to milliseconds
+
+        # Extract the segment
+        segment = audio[start_time:end_time]
+
+        # Get the peak dB level for the segment
+        peak_dba = max(dba_levels[start_idx:end_idx + 1])
+
+        # Generate a filename with the timestamp and peak dB level of the event
+        event_time = timestamps[start_idx]
+        filename = f"{os.path.splitext(os.path.basename(file_path))[0]}_above_{threshold}_{event_time:.2f}s_{peak_dba:.2f}dB.mp3"
+        output_path = os.path.join(above_folder, filename)
+
+        # Save the segment
+        segment.export(output_path, format="mp3")
+        print(f"Saved segment: {output_path}")
+
+        # Add event metadata
+        events.append({
+            "start_time": start_time / 1000,  # Convert back to seconds
+            "end_time": end_time / 1000,  # Convert back to seconds
+            "filename": filename,
+            "peak_dba": peak_dba,
+            "valid": True  # Default to valid
+        })
+
+    # Save events to JSON
+    with open(json_path, "w") as json_file:
+        json.dump(events, json_file, indent=4)
+    print(f"Saved events JSON: {json_path}")
+
 def dbfs(samples):
     rms = np.sqrt(np.mean(samples ** 2))
     return 20 * np.log10(rms + 1e-12)
@@ -159,7 +279,7 @@ def process_calibration_files(folder_path, output_folder):
     return (unsynced_plot_path, synced_plot_path), offsets
 
 
-def process_file(file_path, calibration_offset=132.53):
+def process_file(file_path, calibration_offset=132.53, threshold=60):
     audio = AudioSegment.from_file(file_path)
     duration = len(audio)  # in milliseconds
     step = 1000
@@ -193,13 +313,33 @@ def process_file(file_path, calibration_offset=132.53):
     valid_timestamps = []
     valid_dba_levels = []
 
+    json_path = os.path.join(
+        os.path.dirname(file_path),
+        f"above_{threshold}_dba",
+        f"{os.path.splitext(os.path.basename(file_path))[0]}_events.json"
+    )
+
+    invalid_ranges = []
+    if os.path.exists(json_path):
+        with open(json_path, "r") as json_file:
+            events = json.load(json_file)
+            invalid_ranges = [(event["start_time"], event["end_time"]) for event in events if not event["valid"]]
+
     for t in range(valid_start, valid_end, step):
         start = int(t * fs / 1000)
         end = int((t + step) * fs / 1000)
+        timestamp = t / 1000
+
+        # Check if the timestamp falls within any invalid range
+        if any(start <= timestamp <= end for start, end in invalid_ranges):
+            continue
+
         valid_dba_levels.append(dbfs(weighted[start:end]) + calibration_offset)
-        valid_timestamps.append(t / 1000)
+        valid_timestamps.append(timestamp)
 
     discarded_percentage = ((valid_start + (duration - valid_end)) / duration) * 100
+    if len(timestamps) > 0:
+        discarded_percentage += (1 - len(valid_timestamps) / len(timestamps)) * 100
 
     # Calculate Lday
     if valid_dba_levels:
@@ -281,6 +421,10 @@ def process_folder(data_folder, output_folder):
     for root, dirs, files in os.walk(data_folder):
         relative_path = os.path.relpath(root, data_folder)
         output_subfolder = os.path.join(output_folder, relative_path)
+
+        if relative_path == "." or 'above_60_dba' in relative_path.lower():
+            continue
+
         os.makedirs(output_subfolder, exist_ok=True)
 
         # Process window attenuation
@@ -317,10 +461,8 @@ def process_folder(data_folder, output_folder):
                 window_closed_audio.export(window_closed_path, format="mp4")
                 print(f"Generated missing window_closed file: {window_closed_path}")
 
-        if relative_path == ".":
-            continue
 
-        # elif 'friend' not in relative_path.lower():
+        # elif 'rando' not in relative_path.lower():
         #     continue
 
         if os.path.exists(window_opened_path) and os.path.exists(window_closed_path):
@@ -379,105 +521,103 @@ def process_folder(data_folder, output_folder):
 
                 device_name = os.path.basename(os.path.dirname(file_path))
                 y_offset = y_offsets.get(device_name, 0.0)
+            
+
+                dbfs_levels, fs, timestamps, dba_levels, valid_timestamps, valid_dba_levels, discarded_percentage, lday = process_file(
+                    file_path, calibration_offset=132.53 + y_offset)
                 
-                try:
+                extract_above_dba_segments(file_path, valid_timestamps, valid_dba_levels, root)
 
-                    dbfs_levels, fs, timestamps, dba_levels, valid_timestamps, valid_dba_levels, discarded_percentage, lday = process_file(
-                        file_path, calibration_offset=132.53 + y_offset)
+                avg_valid_dba = np.mean(valid_dba_levels)
 
-                    avg_dba = np.mean(dba_levels)
-                    avg_valid_dba = np.mean(valid_dba_levels)
+                raw_minutes = len(timestamps) / 60
+                good_minutes = len(valid_timestamps) / 60
+                total_raw_minutes += raw_minutes
+                total_good_minutes += good_minutes
 
-                    raw_minutes = len(timestamps) / 60
-                    good_minutes = len(valid_timestamps) / 60
-                    total_raw_minutes += raw_minutes
-                    total_good_minutes += good_minutes
+                valid_ranges[os.path.relpath(file_path, data_folder)] = {
+                    "Valid Start (s)": valid_timestamps[0],
+                    "Valid End (s)": valid_timestamps[-1],
+                    "Discarded (%)": round(discarded_percentage, 2)
+                }
 
-                    valid_ranges[os.path.relpath(file_path, data_folder)] = {
-                        "Valid Start (s)": valid_timestamps[0],
-                        "Valid End (s)": valid_timestamps[-1],
-                        "Discarded (%)": round(discarded_percentage, 2)
-                    }
+                results.append({
+                    "File": os.path.relpath(file_path, data_folder),
+                    "Device Info": device_info,
+                    "Total Duration (s)": round(timestamps[-1] - timestamps[0], 2),
+                    "Calibration Offset Compared to Rando (dB)": round(y_offset, 2),
+                    "Average indoor dB(A)": round(avg_valid_dba, 2),
+                    "Min indoor dB(A)": round(np.min(valid_dba_levels), 2),
+                    "Max indoor dB(A)": round(np.max(valid_dba_levels), 2),
+                    "Discarded (%)": round(discarded_percentage, 2),
+                    "Indoor Lday": round(lday, 2) if lday is not None else "N/A"
+                })
 
-                    results.append({
-                        "File": os.path.relpath(file_path, data_folder),
-                        "Device Info": device_info,
-                        "Total Duration (s)": round(timestamps[-1] - timestamps[0], 2),
-                        "Calibration Offset Compared to Rando (dB)": round(y_offset, 2),
-                        "Average indoor dB(A)": round(avg_valid_dba, 2),
-                        "Min indoor dB(A)": round(np.min(valid_dba_levels), 2),
-                        "Max indoor dB(A)": round(np.max(valid_dba_levels), 2),
-                        "Discarded (%)": round(discarded_percentage, 2),
-                        "Indoor Lday": round(lday, 2) if lday is not None else "N/A"
-                    })
+                # Plot raw dBFS levels
+                plt.figure(figsize=(12, 8))
+                plt.plot(timestamps, dbfs_levels, label="Raw dBFS Levels")
+                plt.xlabel("Time (s)")
+                plt.ylabel("dBFS")
+                plt.title(f"Raw dBFS Levels for {os.path.basename(file_path)}")
+                plt.legend()
+                plt.grid()
+                raw_plot_path = os.path.join(output_subfolder, f"{os.path.splitext(f)[0]}_raw_plot.png")
+                plt.savefig(raw_plot_path)
+                plt.close()
 
-                    # Plot raw dBFS levels
-                    plt.figure(figsize=(12, 8))
-                    plt.plot(timestamps, dbfs_levels, label="Raw dBFS Levels")
-                    plt.xlabel("Time (s)")
-                    plt.ylabel("dBFS")
-                    plt.title(f"Raw dBFS Levels for {os.path.basename(file_path)}")
-                    plt.legend()
-                    plt.grid()
-                    raw_plot_path = os.path.join(output_subfolder, f"{os.path.splitext(f)[0]}_raw_plot.png")
-                    plt.savefig(raw_plot_path)
-                    plt.close()
+                plt.figure(figsize=(12, 8))
+                plt.plot(valid_timestamps, valid_dba_levels, label="dBA (Calibration Only)")
+                plt.xlabel("Time (s)")
+                plt.ylabel("dB(A)")
+                plt.title(f"Calibrated dBA Levels for {os.path.basename(file_path)}")
+                plt.legend()
+                plt.grid()
+                dba_plot_path = os.path.join(output_subfolder, f"{os.path.splitext(f)[0]}_dba_plot.png")
+                plt.savefig(dba_plot_path)
+                plt.close()
 
-                    plt.figure(figsize=(12, 8))
-                    plt.plot(valid_timestamps, valid_dba_levels, label="dBA (Calibration Only)")
-                    plt.xlabel("Time (s)")
-                    plt.ylabel("dB(A)")
-                    plt.title(f"Calibrated dBA Levels for {os.path.basename(file_path)}")
-                    plt.legend()
-                    plt.grid()
-                    dba_plot_path = os.path.join(output_subfolder, f"{os.path.splitext(f)[0]}_dba_plot.png")
-                    plt.savefig(dba_plot_path)
-                    plt.close()
+                # Plot estimated outdoor levels by applying attenuation
+                estimated_outdoor_dba = [dba + attenuation for dba in valid_dba_levels]
+                plt.figure(figsize=(12, 8))
+                plt.plot(valid_timestamps, estimated_outdoor_dba, label="Estimated Outdoor dBA (With Attenuation)")
+                plt.xlabel("Time (s)")
+                plt.ylabel("dB(A)")
+                plt.title(f"Estimated Outdoor dBA for {os.path.basename(file_path)}")
+                plt.legend()
+                plt.grid()
+                dba_with_attenuation_plot_path = os.path.join(output_subfolder, f"{os.path.splitext(f)[0]}_dba_with_attenuation_plot.png")
+                plt.savefig(dba_with_attenuation_plot_path)
+                plt.close()
 
-                    # Plot estimated outdoor levels by applying attenuation
-                    estimated_outdoor_dba = [dba + attenuation for dba in valid_dba_levels]
-                    plt.figure(figsize=(12, 8))
-                    plt.plot(valid_timestamps, estimated_outdoor_dba, label="Estimated Outdoor dBA (With Attenuation)")
-                    plt.xlabel("Time (s)")
-                    plt.ylabel("dB(A)")
-                    plt.title(f"Estimated Outdoor dBA for {os.path.basename(file_path)}")
-                    plt.legend()
-                    plt.grid()
-                    dba_with_attenuation_plot_path = os.path.join(output_subfolder, f"{os.path.splitext(f)[0]}_dba_with_attenuation_plot.png")
-                    plt.savefig(dba_with_attenuation_plot_path)
-                    plt.close()
+                # Add all three plots for main recordings
+                plots.append({
+                    "File": os.path.relpath(file_path, data_folder),
+                    "Raw Plot Path": raw_plot_path,
+                    "dB(A) Plot Path": dba_plot_path,
+                    "dB(A) With Attenuation Plot Path": dba_with_attenuation_plot_path
+                })
 
-                    # Add all three plots for main recordings
-                    plots.append({
-                        "File": os.path.relpath(file_path, data_folder),
-                        "Raw Plot Path": raw_plot_path,
-                        "dB(A) Plot Path": dba_plot_path,
-                        "dB(A) With Attenuation Plot Path": dba_with_attenuation_plot_path
-                    })
+                # Generate CSV files
+                base_filename = os.path.splitext(f)[0]
+                closed_csv_path = os.path.join(output_subfolder, f"{base_filename}_closed.csv")
+                open_csv_path = os.path.join(output_subfolder, f"{base_filename}_open.csv")
 
-                    # Generate CSV files
-                    base_filename = os.path.splitext(f)[0]
-                    closed_csv_path = os.path.join(output_subfolder, f"{base_filename}_closed.csv")
-                    open_csv_path = os.path.join(output_subfolder, f"{base_filename}_open.csv")
+                # Write closed CSV (calibration offset only)
+                with open(closed_csv_path, mode="w", newline="") as closed_csv:
+                    writer = csv.writer(closed_csv)
+                    writer.writerow(["Timestamp (s)", "dBA (Calibration Only)"])
+                    for ts, dba in zip(valid_timestamps, valid_dba_levels):
+                        writer.writerow([ts, dba])
 
-                    # Write closed CSV (calibration offset only)
-                    with open(closed_csv_path, mode="w", newline="") as closed_csv:
-                        writer = csv.writer(closed_csv)
-                        writer.writerow(["Timestamp (s)", "dBA (Calibration Only)"])
-                        for ts, dba in zip(valid_timestamps, valid_dba_levels):
-                            writer.writerow([ts, dba])
+                # Write open CSV (estimated outdoor level)
+                with open(open_csv_path, mode="w", newline="") as open_csv:
+                    writer = csv.writer(open_csv)
+                    writer.writerow(["Timestamp (s)", "Estimated Outdoor dBA (With Attenuation)"])
+                    for ts, dba in zip(valid_timestamps, estimated_outdoor_dba):
+                        writer.writerow([ts, dba])
 
-                    # Write open CSV (estimated outdoor level)
-                    with open(open_csv_path, mode="w", newline="") as open_csv:
-                        writer = csv.writer(open_csv)
-                        writer.writerow(["Timestamp (s)", "Estimated Outdoor dBA (With Attenuation)"])
-                        for ts, dba in zip(valid_timestamps, estimated_outdoor_dba):
-                            writer.writerow([ts, dba])
+                print(f"Plots and CSV files saved for {file_path}")
 
-                    print(f"Plots and CSV files saved for {file_path}")
-
-                except Exception as e:
-                    print(f"Error processing {file_path}: {e}")
 
     json_path = os.path.join(data_folder, "valid_ranges.json")
     with open(json_path, "w") as json_file:
