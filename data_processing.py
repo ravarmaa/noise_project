@@ -61,8 +61,8 @@ from scipy.optimize import least_squares
 
 def process_calibration_files(folder_path, output_folder):
     """
-    Load and plot raw dBFS signals from calibration recordings.
-    Synchronize signals using least squares fitting.
+    Load and plot A-weighted dBFS signals from calibration recordings.
+    Synchronize signals using least squares fitting for both time and y-scale offsets.
     """
     calibration_files = []
     for root, _, files in os.walk(folder_path):
@@ -72,9 +72,10 @@ def process_calibration_files(folder_path, output_folder):
 
     if not calibration_files:
         print("No calibration files found.")
-        return None, None
+        return None, None, None, []
 
-    signals = []  # (device_name, dbfs_levels, timestamps)
+    signals = []  # (device_name, a_weighted_levels, timestamps)
+    offsets = []  # Store time and y-scale offsets for each device
 
     for file_path in calibration_files:
         audio = AudioSegment.from_file(file_path)
@@ -86,58 +87,76 @@ def process_calibration_files(folder_path, output_folder):
             samples = samples.reshape((-1, audio.channels)).mean(axis=1)
 
         interval = fs
-        dbfs_levels = []
+        a_weighted_levels = []
         timestamps = []
+        weighted_samples = apply_a_weighting(samples, fs)
 
         for i in range(0, len(samples) - interval + 1, interval):
-            chunk = samples[i:i + interval]
-            dbfs_levels.append(dbfs(chunk))
+            chunk = weighted_samples[i:i + interval]
+            a_weighted_levels.append(dbfs(chunk))
             timestamps.append(i / fs)
 
         device_name = os.path.basename(os.path.dirname(file_path))
-        signals.append((device_name, dbfs_levels, timestamps))
+        signals.append((device_name, a_weighted_levels, timestamps))
 
-    # Plot raw dBFS signals
-    unsynced_plot_path = os.path.join(output_folder, "calibration_dbfs_unsynced_plot.png")
+    # Find the reference signal (contains "Rando")
+    reference_signal = None
+    for device_name, a_weighted_levels, timestamps in signals:
+        if "Rando" in device_name:
+            reference_signal = (device_name, a_weighted_levels, timestamps)
+            break
+
+    if reference_signal is None:
+        raise ValueError("No calibration file with 'Rando' found.")
+
+    ref_device_name, ref_levels, ref_timestamps = reference_signal
+
+    # Synchronize signals using fit_time_and_y_offset
+    synced_signals = [(ref_device_name, ref_levels, ref_timestamps)]  # Add the reference signal
+
+    for device_name, levels, timestamps in signals:
+        if device_name == ref_device_name:
+            continue
+
+        time_offset, y_offset = fit_time_and_y_offset(ref_levels, ref_timestamps, levels, timestamps)
+        offsets.append({"Device": device_name, "Time Offset (s)": round(time_offset, 3), "Y Offset (dB)": round(y_offset, 3)})
+
+        # Apply the offsets
+        shifted_timestamps = [t + time_offset for t in timestamps]
+        interp_func = interp1d(shifted_timestamps, levels, bounds_error=False, fill_value="extrapolate")
+        aligned_levels = interp_func(ref_timestamps) + y_offset
+        synced_signals.append((device_name, aligned_levels, ref_timestamps))
+
+    # Plot synced A-weighted dBFS signals
+    synced_plot_path = os.path.join(output_folder, "calibration_a_weighted_synced_plot.png")
     plt.figure(figsize=(12, 6))
-    for device_name, dbfs_levels, timestamps in signals:
-        plt.plot(timestamps, dbfs_levels, label=device_name)
+    for device_name, levels, timestamps in synced_signals:
+        plt.plot(timestamps, levels, label=device_name)
     plt.legend()
-    plt.title("Raw dBFS Signals from Calibration Recordings (Unsynced)")
+    plt.title("A-Weighted dBFS Signals from Calibration Recordings (Synced)")
     plt.xlabel("Time (s)")
-    plt.ylabel("dBFS")
-    plt.grid()
-    plt.savefig(unsynced_plot_path)
-    plt.close()
-
-    # Synchronize signals using calculate_time_offset
-    reference_signal = signals[0][1]  # Use the first device as the reference
-    reference_timestamps = signals[0][2]
-
-    synced_signals = [(signals[0][0], reference_signal, reference_timestamps)]  # Add the reference signal
-
-    for device_name, dbfs_levels, timestamps in signals[1:]:
-        offset = calculate_time_offset(reference_signal, dbfs_levels)
-        shifted_timestamps = [t - offset for t in timestamps]
-        synced_signals.append((device_name, dbfs_levels, shifted_timestamps))
-        print(f"Calculated offset for {device_name}: {offset:.3f} seconds")
-
-    # Plot synced dBFS signals
-    synced_plot_path = os.path.join(output_folder, "calibration_dbfs_synced_plot.png")
-    plt.figure(figsize=(12, 6))
-    for device_name, dbfs_levels, timestamps in synced_signals:
-        plt.plot(timestamps, dbfs_levels, label=device_name)
-    plt.legend()
-    plt.title("Raw dBFS Signals from Calibration Recordings (Synced)")
-    plt.xlabel("Time (s)")
-    plt.ylabel("dBFS")
+    plt.ylabel("A-Weighted dBFS")
     plt.grid()
     plt.savefig(synced_plot_path)
     plt.close()
 
+    # Plot unsynced A-weighted dBFS signals
+    unsynced_plot_path = os.path.join(output_folder, "calibration_a_weighted_unsynced_plot.png")
+    plt.figure(figsize=(12, 6))
+    for device_name, levels, timestamps in signals:
+        plt.plot(timestamps, levels, label=device_name)
+    plt.legend()
+    plt.title("A-Weighted dBFS Signals from Calibration Recordings (Unsynced)")
+    plt.xlabel("Time (s)")
+    plt.ylabel("A-Weighted dBFS")
+    plt.grid()
+    plt.savefig(unsynced_plot_path)
+    plt.close()
+
     print(f"Unsynced plot saved to {unsynced_plot_path}")
     print(f"Synced plot saved to {synced_plot_path}")
-    return unsynced_plot_path, synced_plot_path
+    
+    return (unsynced_plot_path, synced_plot_path), offsets
 
 
 def process_file(file_path, calibration_offset=132.53):
@@ -195,32 +214,22 @@ from scipy.interpolate import interp1d
 from scipy.optimize import least_squares
 import numpy as np
 
-def calculate_time_offset(reference, signal):
+def fit_time_and_y_offset(reference_levels, reference_timestamps, levels, timestamps):
     """
-    Calculates sub-second time offset between two 1 Hz signals (e.g., dBFS time series)
-    using least squares fitting. Returns a float offset (in seconds).
-    Positive offset means `signal` lags behind `reference`.
+    Fits both time and y-scale offsets between a reference signal and another signal.
+    Returns the time offset (in seconds) and y-scale offset (in dB).
     """
+    def residuals(params):
+        time_offset, y_offset = params
+        shifted_timestamps = [t + time_offset for t in timestamps]
+        interp_func = interp1d(shifted_timestamps, levels, bounds_error=False, fill_value="extrapolate")
+        aligned_levels = interp_func(reference_timestamps) + y_offset
+        return reference_levels - aligned_levels
 
-    reference = np.array(reference)
-    signal = np.array(signal)
-
-    if len(signal) != len(reference):
-        # Truncate to shortest length for alignment
-        min_len = min(len(reference), len(signal))
-        reference = reference[:min_len]
-        signal = signal[:min_len]
-
-    x = np.arange(len(signal))
-    signal_interp = interp1d(x, signal, kind="linear", fill_value="extrapolate")
-
-    def error(offset):
-        shifted_x = x + offset[0]
-        shifted_signal = signal_interp(shifted_x)
-        return reference - shifted_signal
-
-    result = least_squares(error, [0.0], bounds=(-10.0, 10.0))
-    return result.x[0]  # float offset in seconds
+    # Initial guess: no time offset, no y-scale offset
+    initial_guess = [0.0, 0.0]
+    result = least_squares(residuals, initial_guess, bounds=([-10.0, -20.0], [10.0, 20.0]), loss='soft_l1', f_scale=0.1)
+    return result.x[0], result.x[1]  # time_offset, y_offset
 
 def process_window_file(file_path, calibration_offset=132.53):
     """
@@ -266,7 +275,8 @@ def process_folder(data_folder, output_folder):
     total_good_minutes = 0
 
     # Process calibration files
-    calibration_plot = process_calibration_files(data_folder, output_folder)
+    calibration_plot, offsets = process_calibration_files(data_folder, output_folder)
+    y_offsets = {offset["Device"]: offset["Y Offset (dB)"] for offset in offsets}
 
     for root, dirs, files in os.walk(data_folder):
         relative_path = os.path.relpath(root, data_folder)
@@ -366,10 +376,14 @@ def process_folder(data_folder, output_folder):
             if (f_lower.endswith(".m4a") or f_lower.endswith(".mp4")) and \
                "open" not in f_lower and "close" not in f_lower and "calibration" not in f_lower:
                 file_path = os.path.join(root, f)
+
+                device_name = os.path.basename(os.path.dirname(file_path))
+                y_offset = y_offsets.get(device_name, 0.0)
+                
                 try:
 
                     dbfs_levels, fs, timestamps, dba_levels, valid_timestamps, valid_dba_levels, discarded_percentage, lday = process_file(
-                        file_path, calibration_offset=132.53)
+                        file_path, calibration_offset=132.53 + y_offset)
 
                     avg_dba = np.mean(dba_levels)
                     avg_valid_dba = np.mean(valid_dba_levels)
@@ -389,7 +403,8 @@ def process_folder(data_folder, output_folder):
                         "File": os.path.relpath(file_path, data_folder),
                         "Device Info": device_info,
                         "Total Duration (s)": round(timestamps[-1] - timestamps[0], 2),
-                        "Average indoor dB(A)": round(avg_valid_dba),
+                        "Calibration Offset Compared to Rando (dB)": round(y_offset, 2),
+                        "Average indoor dB(A)": round(avg_valid_dba, 2),
                         "Min indoor dB(A)": round(np.min(valid_dba_levels), 2),
                         "Max indoor dB(A)": round(np.max(valid_dba_levels), 2),
                         "Discarded (%)": round(discarded_percentage, 2),
@@ -549,6 +564,7 @@ def generate_html_report(results_df, plots, output_path, total_raw_minutes, tota
                     <th>Device Info</th>
                     <th>Total Duration (s)</th>
                     <th>Discarded (%)</th>
+                    <th>Calibration Offset Compared to Rando (dB)</th>
                     <th>Average indoor dB(A)</th>
                     <th>Min indoor dB(A)</th>
                     <th>Max indoor dB(A)</th>
@@ -562,6 +578,7 @@ def generate_html_report(results_df, plots, output_path, total_raw_minutes, tota
                     <td>{{ row["Device Info"] }}</td>
                     <td>{{ row["Total Duration (s)"] }}</td>
                     <td>{{ row["Discarded (%)"] }}</td>
+                    <td>{{ row["Calibration Offset Compared to Rando (dB)"] }}</td>
                     <td>{{ row["Average indoor dB(A)"] }}</td>
                     <td>{{ row["Min indoor dB(A)"] }}</td>
                     <td>{{ row["Max indoor dB(A)"] }}</td>
