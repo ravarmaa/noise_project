@@ -337,9 +337,28 @@ def process_file(file_path, calibration_offset=132.53, threshold=60):
         valid_dba_levels.append(dbfs(weighted[start:end]) + calibration_offset)
         valid_timestamps.append(timestamp)
 
-    discarded_percentage = ((valid_start + (duration - valid_end)) / duration) * 100
-    if len(timestamps) > 0:
-        discarded_percentage += (1 - len(valid_timestamps) / len(timestamps)) * 100
+    total_duration = duration / 1000  # Convert milliseconds to seconds
+
+    # Calculate the valid duration based on valid_start and valid_end
+    valid_duration = (valid_end - valid_start) / 1000  # Convert milliseconds to seconds
+
+    # Calculate the invalid duration from invalid_ranges
+    invalid_duration = 0
+    for start, end in invalid_ranges:
+        # Only consider ranges that overlap with the valid range
+        overlap_start = max(start, valid_start / 1000)  # Convert valid_start to seconds
+        overlap_end = min(end, valid_end / 1000)  # Convert valid_end to seconds
+        if overlap_start < overlap_end:  # Ensure there is an overlap
+            invalid_duration += overlap_end - overlap_start
+
+    # Calculate the final valid duration
+    final_valid_duration = valid_duration - invalid_duration
+
+    # Calculate the discarded duration
+    discarded_duration = total_duration - final_valid_duration
+
+    # Calculate the discarded percentage
+    discarded_percentage = (discarded_duration / total_duration) * 100 if total_duration > 0 else 0
 
     # Calculate Lday
     if valid_dba_levels:
